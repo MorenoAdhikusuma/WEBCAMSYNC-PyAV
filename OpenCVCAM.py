@@ -1,0 +1,445 @@
+import cv2
+import threading
+import time
+import av
+import numpy as np
+import os
+import queue
+from datetime import datetime
+
+# CHANGE TO YOUR OUTPUT DIRECTORY
+OUTPUT_DIR = r"C:\Users\moreno\programming\Scientific_Works\senyum\Not_experiment\OUTPUT_VID"
+SESSIONS_DIR = os.path.join(OUTPUT_DIR, "sessions")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+class SyncedCameraWorker(threading.Thread):
+    def __init__(self, cam_index, session_id):
+        super().__init__()
+        self.cam_index = cam_index
+        self.session_id = session_id
+        self.cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Cannot open camera {cam_index}")
+
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if self.fps <= 0 or self.fps > 60:
+            self.fps = 30
+
+        # For display
+        self.frame = None
+        self.running = True
+        self.recording = False
+        self.output = None
+        self.stream = None
+        self.lock = threading.Lock()
+        
+        # Synchronization attributes
+        self.master_start_time = None
+        self.frame_count = 0
+        
+        # Frame queue for encoding
+        self.frame_queue = queue.Queue(maxsize=30)
+        self.encoding_thread = None
+        
+        # Downscale factor for preview
+        self.preview_scale = 0.5
+
+    def set_master_start_time(self, master_start_time):
+        """Set synchronized start time across all cameras"""
+        self.master_start_time = master_start_time
+
+    def start_recording(self):
+        if self.master_start_time is None:
+            raise RuntimeError("Master start time not set. Call set_master_start_time first.")
+            
+        # Create session directory
+        session_dir = os.path.join(SESSIONS_DIR, f"session_{self.session_id}")
+        cam_dir = os.path.join(session_dir, f"cam_{self.cam_index}")
+        os.makedirs(cam_dir, exist_ok=True)
+        
+        # Video file setup
+        timestamp_str = datetime.fromtimestamp(self.master_start_time).strftime("%Y%m%d_%H%M%S%f")
+        filename = os.path.join(cam_dir, f'cam_{self.cam_index}_{timestamp_str}.mp4')
+        self.output = av.open(filename, mode='w')
+        
+        # PyAV setup with timecode
+        self.stream = self.output.add_stream('libx264', rate=self.fps)
+        
+        # Calculate timecode from master start time
+        start_dt = datetime.fromtimestamp(self.master_start_time)
+        timecode_str = start_dt.strftime("%H:%M:%S:00")
+        self.stream.metadata['timecode'] = timecode_str
+        
+        self.stream.width = self.width
+        self.stream.height = self.height
+        self.stream.pix_fmt = 'yuv420p'
+        self.stream.options = {'preset': 'ultrafast', 'crf': '23'}
+        
+        self.recording = True
+        self.frame_count = 0
+        
+        # Start encoding thread
+        self.encoding_thread = threading.Thread(target=self.encoding_worker)
+        self.encoding_thread.daemon = True
+        self.encoding_thread.start()
+        
+        print(f"[Camera {self.cam_index}] Recording started: {filename}")
+        print(f"[Camera {self.cam_index}] Timecode: {timecode_str}")
+
+    def encoding_worker(self):
+        """Separate thread for encoding frames to video"""
+        while self.recording:
+            try:
+                frame_data = self.frame_queue.get(timeout=0.5)
+                
+                if frame_data is None:
+                    break
+                    
+                frame, timestamp = frame_data
+                
+                # Encode the frame
+                video_frame = av.VideoFrame.from_ndarray(frame, format='bgr24')
+                
+                # Calculate PTS based on master start time for perfect sync
+                time_since_master_start = timestamp - self.master_start_time
+                pts = int(time_since_master_start * self.fps)
+                video_frame.pts = pts
+                
+                for packet in self.stream.encode(video_frame):
+                    self.output.mux(packet)
+                
+                self.frame_count += 1
+                self.frame_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Error in encoding thread cam {self.cam_index}: {e}")
+
+    def calculate_timecode(self, time_offset):
+        """Calculate SMPTE timecode from time offset"""
+        total_seconds = int(time_offset)
+        frames = int((time_offset - total_seconds) * self.fps)
+        
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}"
+
+    def stop_recording(self):
+        if self.recording:
+            self.recording = False
+            
+            # Signal encoding thread to finish
+            self.frame_queue.put(None)
+            
+            if self.encoding_thread:
+                self.encoding_thread.join(timeout=5.0)
+            
+            elapsed = time.time() - self.master_start_time if self.master_start_time else 0
+            actual_fps = self.frame_count / elapsed if elapsed > 0 else 0
+            
+            print(f"[Camera {self.cam_index}] Recording stopped.")
+            print(f"[Camera {self.cam_index}] Total frames: {self.frame_count}")
+            print(f"[Camera {self.cam_index}] Duration: {elapsed:.2f}s, Effective FPS: {actual_fps:.2f}")
+            
+            try:
+                # Flush remaining frames
+                for packet in self.stream.encode(None):
+                    self.output.mux(packet)
+                self.output.close()
+            except Exception as e:
+                print(f"Error closing output: {e}")
+
+    def run(self):
+        target_fps = self.fps
+        frame_interval = 1.0 / target_fps
+        last_capture_time = time.time()
+        
+        # For frame skipping in display
+        frame_count = 0
+        display_interval = 2
+
+        while self.running:
+            current_time = time.time()
+            time_since_last_capture = current_time - last_capture_time
+            
+            if time_since_last_capture < frame_interval:
+                sleep_time = max(0.001, frame_interval - time_since_last_capture)
+                time.sleep(sleep_time)
+                continue
+                
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+                
+            last_capture_time = current_time
+            frame_count += 1
+            
+            timestamp = time.time()
+            
+            # Calculate timing info
+            if self.recording and self.master_start_time:
+                time_since_master = timestamp - self.master_start_time
+                timecode = self.calculate_timecode(time_since_master)
+                timing_text = f'Cam {self.cam_index}: {timecode} ({time_since_master:.3f}s)'
+            else:
+                timing_text = f'Cam {self.cam_index}: Standby'
+            
+            # Display frame processing
+            if frame_count % display_interval == 0:
+                preview_frame = cv2.resize(frame, (0, 0), fx=self.preview_scale, fy=self.preview_scale)
+                cv2.putText(preview_frame, timing_text, 
+                           (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                
+                with self.lock:
+                    self.frame = preview_frame
+
+            # Recording frame processing
+            if self.recording and not self.frame_queue.full():
+                # Add timing overlay to recorded frame
+                cv2.putText(frame, timing_text, 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                try:
+                    self.frame_queue.put((frame.copy(), timestamp), block=False)
+                except queue.Full:
+                    pass
+
+        self.stop_recording()
+        self.cap.release()
+
+
+class SmartCombiner:
+    """combines camera frames for display"""
+    def __init__(self, max_width=1920, max_height=1080):
+        self.max_width = max_width
+        self.max_height = max_height
+        self.last_grid = None
+        self.last_update = 0
+        self.update_interval = 1/30  
+        
+    def combine_frames(self, frames, cols=2):
+        current_time = time.time()
+        
+        if self.last_grid is not None and (current_time - self.last_update) < self.update_interval:
+            return self.last_grid
+            
+        if not frames:
+            return None
+            
+        h_max = max(f.shape[0] for f in frames)
+        w_max = max(f.shape[1] for f in frames)
+        rows = (len(frames) + cols - 1) // cols
+        
+        grid = np.zeros((h_max * rows, w_max * cols, 3), dtype=np.uint8)
+        
+        for idx, frame in enumerate(frames):
+            r = idx // cols
+            c = idx % cols
+            h, w = frame.shape[:2]
+
+            y_offset = r * h_max + (h_max - h) // 2
+            x_offset = c * w_max + (w_max - w) // 2
+            grid[y_offset:y_offset+h, x_offset:x_offset+w] = frame
+        
+        grid_h, grid_w = grid.shape[:2]
+        if grid_w > self.max_width or grid_h > self.max_height:
+            scale = min(self.max_width / grid_w, self.max_height / grid_h)
+            new_w = int(grid_w * scale)
+            new_h = int(grid_h * scale)
+            grid = cv2.resize(grid, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        self.last_grid = grid
+        self.last_update = current_time
+        return grid
+
+
+def create_session_info(cameras, session_id, master_start_time):
+    """Create session info file for later dataset extraction"""
+    session_dir = os.path.join(SESSIONS_DIR, f"session_{session_id}")
+    timestamp_str = datetime.fromtimestamp(master_start_time).strftime("%Y%m%d_%H%M%S")
+    
+    
+    session_info = {
+        'session_id': session_id,
+        'master_start_time': master_start_time,
+        'start_datetime': datetime.fromtimestamp(master_start_time).isoformat(),
+        'end_datetime': datetime.now().isoformat(),
+        'cameras': [],
+        'synchronization_info': {
+            'method': 'master_start_time',
+            'precision': 'millisecond',
+            'timecode_format': 'HH:MM:SS:FF'
+        },
+        'files': {
+            'session_directory': session_dir,
+            'video_files': []
+        }
+    }
+    
+    for cam in cameras:
+        video_filename = f'cam_{cam.cam_index}_{timestamp_str}.mp4'
+        video_path = os.path.join(session_dir, f"cam_{cam.cam_index}", video_filename)
+        
+        cam_info = {
+            'camera_id': cam.cam_index,
+            'resolution': [cam.width, cam.height],
+            'fps': cam.fps,
+            'total_frames_recorded': cam.frame_count,
+            'video_file': video_filename,
+            'video_path': video_path
+        }
+        session_info['cameras'].append(cam_info)
+        session_info['files']['video_files'].append(video_path)
+
+def main():
+    # Generate unique session ID
+    session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"Starting Recording Session: {session_id}")
+    
+    # Camera indices
+    camera_indices = [0, 1, 2]
+    
+    # Try to open cameras
+    cameras = []
+    for i in camera_indices:
+        try:
+            cam = SyncedCameraWorker(i, session_id)
+            cameras.append(cam)
+            print(f"Camera {i} initialized successfully")
+        except RuntimeError as e:
+            print(f"Couldn't initialize camera {i}: {e}")
+    
+    if not cameras:
+        print("No cameras available. Exiting.")
+        return
+    
+    # Start camera threads
+    for cam in cameras:
+        cam.start()
+
+    recording = False
+    master_start_time = None
+    
+    print("\n=== Multi-Camera Recording Controls ===")
+    print("Press 'r' to start/stop recording")
+    print("======================================\n")
+
+    window_name = 'Multi-Camera Recording'
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    
+    combiner = SmartCombiner()
+    
+    last_ui_update = 0
+    ui_refresh_rate = 1/30
+
+    try:
+        while True:
+            current_time = time.time()
+            
+            if current_time - last_ui_update < ui_refresh_rate:
+                key = cv2.waitKey(1) & 0xFF
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+                elif key == ord('r'):
+                    recording = not recording
+                    if recording:
+                        # Set synchronized start time
+                        master_start_time = time.time()
+                        
+                        print(f"\n=== STARTING RECORDING SESSION {session_id} ===")
+                        print(f"Master Start Time: {datetime.fromtimestamp(master_start_time).isoformat()}")
+                        
+                        # Set master start time for all cameras
+                        for cam in cameras:
+                            cam.set_master_start_time(master_start_time)
+                            cam.start_recording()
+                            
+                        print("All cameras synchronized and recording started!")
+                        
+                    else:
+                        print("\n=== STOPPING RECORDING ===")
+                        for cam in cameras:
+                            cam.stop_recording()
+                        print("Recording stopped!")
+                        
+                time.sleep(0.001)
+                continue
+                
+            # Update display
+            frames = []
+            for cam in cameras:
+                with cam.lock:
+                    if cam.frame is not None:
+                        frames.append(cam.frame)
+                    else:
+                        blank = np.zeros((int(cam.height * cam.preview_scale), 
+                                         int(cam.width * cam.preview_scale), 3), 
+                                         dtype=np.uint8)
+                        cv2.putText(blank, f'Cam {cam.cam_index}: No Signal', 
+                                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                        frames.append(blank)
+
+            combined = combiner.combine_frames(frames, cols=2)
+            
+            if combined is not None:
+                # Add session info to display
+                status_text = f"Session: {session_id} | Recording: {'ON' if recording else 'OFF'}"
+                if recording and master_start_time:
+                    elapsed = time.time() - master_start_time
+                    status_text += f" | Duration: {int(elapsed//60):02d}:{int(elapsed%60):02d}"
+                
+                cv2.putText(combined, status_text, (10, combined.shape[0] - 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                
+                cv2.imshow(window_name, combined)
+                last_ui_update = current_time
+
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF 
+            
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1 or key == ord('q'):
+                break
+            elif key == ord('r'):
+                recording = not recording
+                if recording:
+                    master_start_time = time.time()
+                    print(f"\n=== STARTING RECORDING SESSION {session_id} ===")
+                    print(f"Master Start Time: {datetime.fromtimestamp(master_start_time).isoformat()}")
+                    
+                    for cam in cameras:
+                        cam.set_master_start_time(master_start_time)
+                        cam.start_recording()
+                        
+                    print("All cameras synchronized and recording started!")
+                    
+                else:
+                    print("\n=== STOPPING RECORDING ===")
+                    for cam in cameras:
+                        cam.stop_recording()
+                    print("Recording stopped!")
+                        
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Cleaning up...")  
+    finally:
+        # Cleanup
+        for cam in cameras:
+            cam.running = False
+            cam.join()
+
+        cv2.destroyAllWindows()
+        
+        print(f"\n=== SESSION {session_id} COMPLETED ===")
+        print(f"Session files saved in: {os.path.join(SESSIONS_DIR, f'session_{session_id}')}")
+        print("Program exited cleanly.")
+
+
+if __name__ == "__main__":
+    main()
