@@ -24,8 +24,8 @@ for i, name in enumerate(devices):
         print(f"Skipping camera: {name}")
 
 class CameraWorker(threading.Thread):
-    def _init_(self, cam_index):
-        super()._init_()
+    def __init__(self, cam_index):
+        super().__init__()
         self.cam_index = cam_index
         self.cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
@@ -199,58 +199,62 @@ class CameraWorker(threading.Thread):
 
 #ini buat combine CAM nya
 class SmartCombiner:
-    """Efficiently combines camera frames for display"""
-    def _init_(self, max_width=1920, max_height=1080):
+    def __init__(self, max_width=1920, max_height=1080):
         self.max_width = max_width
         self.max_height = max_height
         self.last_grid = None
         self.last_update = 0
-        self.update_interval = 1/30  # 30 FPS for UI updates
-        
+        self.update_interval = 1/60 # 30 FPS for UI updates
+
     def combine_frames(self, frames, cols=2):
         current_time = time.time()
-        
-        # Return cached grid if not enough time has passed
+
         if self.last_grid is not None and (current_time - self.last_update) < self.update_interval:
             return self.last_grid
-            
+
         if not frames:
             return None
-            
-        # Calculate grid dimensions
+
+        # ini ganti aja kalo kamera nya lebih
+        while len(frames) < 4:
+            h, w = frames[0].shape[:2] if frames else (240, 320)
+            blank = np.zeros((h, w, 3), dtype=np.uint8)
+            frames.append(blank)
+
+        rows = 2
         h_max = max(f.shape[0] for f in frames)
         w_max = max(f.shape[1] for f in frames)
-        rows = (len(frames) + cols - 1) // cols
-        
-        # Create the grid
+
         grid = np.zeros((h_max * rows, w_max * cols, 3), dtype=np.uint8)
-        
-        for idx, frame in enumerate(frames):
+
+        for idx in range(4):
+            frame = frames[idx]
             r = idx // cols
             c = idx % cols
             h, w = frame.shape[:2]
 
             y_offset = r * h_max + (h_max - h) // 2
             x_offset = c * w_max + (w_max - w) // 2
+
             grid[y_offset:y_offset+h, x_offset:x_offset+w] = frame
-        
-        # Check if we need to scale down the grid
+
         grid_h, grid_w = grid.shape[:2]
         if grid_w > self.max_width or grid_h > self.max_height:
             scale = min(self.max_width / grid_w, self.max_height / grid_h)
             new_w = int(grid_w * scale)
             new_h = int(grid_h * scale)
             grid = cv2.resize(grid, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        
+
         self.last_grid = grid
         self.last_update = current_time
         return grid
 
 
+
 def main():
     NUM_CAMERAS = 3  # Change if you have more cams
     
-    # Try to open cameras and handle failures gracefully
+    # Try to open cameras and handle failure gracefully and show error
     cameras = []
     for i in cameras_identifier:
         try:
@@ -269,7 +273,7 @@ def main():
     recording = False
     print("Press 'r' to start/stop recording, 'q' to quit.")
 
-    window_name = 'MultiCam Preview'
+    window_name = 'MULTICAM'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)  # allow resize by mouse
     
     # Smart frame combiner
