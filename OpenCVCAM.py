@@ -6,7 +6,31 @@ import numpy as np
 import os
 import queue
 from collections import deque
+import datetime
 from pygrabber.dshow_graph import FilterGraph
+import subprocess
+
+def add_start_time_metadata(mp4_path, start_time_str):
+    """Adds creation_time metadata to an MP4 file using ffmpeg"""
+    base, ext = os.path.splitext(mp4_path)
+    output_path = base + "_withmeta" + ext
+
+    cmd = [
+        'ffmpeg',
+        '-y',  
+        '-i', mp4_path,
+        '-metadata', f'creation_time={start_time_str}',  # <-- THIS IS THE FIX
+        '-codec', 'copy',
+        output_path
+    ]
+
+    try:
+        subprocess.run(cmd, check=True)
+        os.replace(output_path, mp4_path)  # Replace original
+        print(f"[FFMPEG] Metadata added to {mp4_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"[FFMPEG] Failed to add metadata: {e}")
+
 
 #GANTI SESUAI FOLDER OUTPUT DIR
 OUTPUT_DIR = r"C:\Users\moreno\programming\Scientific_Works\senyum\Not_experiment\OUTPUT_VID"
@@ -16,12 +40,27 @@ cameras_identifier = []
 
 graph = FilterGraph()
 devices = graph.get_input_devices()
-for i, name in enumerate(devices):
-    if name.startswith("GENERAL"):
-        cameras_identifier.append(i)
-        print(f"Found camera: {name}")
+max_cams_to_check = 10  # Change if you expect more
+
+cameras_identifier = []
+
+for real_index in range(max_cams_to_check):
+    cap = cv2.VideoCapture(real_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap.release()
+        continue
+    try:
+        name = devices[real_index]
+    except IndexError:
+        name = "Unknown"
+
+    if name.startswith("Integrated Camera"):
+        cameras_identifier.append(real_index)
+        print(f"Using camera index {real_index}: {name}")
     else:
-        print(f"Skipping camera: {name}")
+        print(f"Skipping camera index {real_index}: {name}")
+    
+    cap.release()
 
 class CameraWorker(threading.Thread):
     def __init__(self, cam_index):
@@ -113,6 +152,7 @@ class CameraWorker(threading.Thread):
         except Exception as e:
             print(f"Error flushing frames: {e}")
 
+
     def stop_recording(self):
         if self.recording:
             self.recording = False
@@ -122,7 +162,7 @@ class CameraWorker(threading.Thread):
             
             if self.encoding_thread:
                 self.encoding_thread.join(timeout=5.0)
-                
+            
             elapsed = time.time() - self.start_time
             actual_fps = self.frame_count / elapsed if elapsed > 0 else 0
             print(f"[Camera {self.cam_index}] Recording stopped. Frames: {self.frame_count}, "
@@ -132,6 +172,12 @@ class CameraWorker(threading.Thread):
                 self.output.close()
             except Exception as e:
                 print(f"Error closing output: {e}")
+            
+            # Add metadata after closing the file with UTC+7 timezone
+            utc_plus_7 = datetime.timezone(datetime.timedelta(hours=7))
+            iso_start_time = datetime.datetime.fromtimestamp(self.start_time, tz=utc_plus_7).isoformat(timespec='milliseconds')
+            filename = os.path.join(OUTPUT_DIR, f'cam_{self.cam_index}.mp4')
+            add_start_time_metadata(filename, iso_start_time)
 
     def run(self):
         target_fps = self.fps
@@ -166,7 +212,10 @@ class CameraWorker(threading.Thread):
             
             # Calculate frame time (time elapsed since recording started)
             frame_time = timestamp - self.start_time if self.recording and self.start_time else 0
-            frame_time_text = f'{int(frame_time//60):02d}:{int(frame_time%60):02d}.{int((frame_time%1)*1000):03d}'
+            
+            # Create UTC+7 timestamp for display
+            utc_plus_7 = datetime.timezone(datetime.timedelta(hours=7))
+            frame_time_text = datetime.datetime.fromtimestamp(timestamp, tz=utc_plus_7).isoformat(timespec='milliseconds')
             
             # Only process frames for display at reduced rate
             if frame_count % display_interval == 0:
