@@ -5,7 +5,8 @@ import av
 import datetime
 import subprocess
 import json
-from datetime import datetime, timedelta
+import piexif
+from datetime import datetime, timedelta, timezone
 
 # ---- Get metadata using ffprobe ----
 def get_video_metadata(path: str) -> dict:
@@ -28,16 +29,14 @@ def get_video_metadata(path: str) -> dict:
         format_tags.get("creation_time") or
         stream_tags.get("creation_time")
     )
-    
-    # Convert to Unix timestamp
-    unix_timestamp = None
+
+    dt_utc = None
     if creation_time:
         try:
             if creation_time.endswith('Z'):
-                dt = datetime.fromisoformat(creation_time[:-1] + '+00:00')
+                dt_utc = datetime.fromisoformat(creation_time[:-1] + '+00:00')
             else:
-                dt = datetime.fromisoformat(creation_time)
-            unix_timestamp = int(dt.timestamp())
+                dt_utc = datetime.fromisoformat(creation_time)
         except ValueError:
             pass
 
@@ -46,115 +45,96 @@ def get_video_metadata(path: str) -> dict:
         "bit_rate": metadata.get("format", {}).get("bit_rate"),
         "filename": metadata.get("format", {}).get("filename"),
         "start_time": metadata.get("format", {}).get("start_time"),
-        "creation_time": creation_time,
-        "unix_timestamp": unix_timestamp
+        "creation_time": dt_utc.isoformat() if dt_utc else None,
+        "datetime_utc": dt_utc
     }
 
-# ---- Extract frames with Unix timestamps ----
-def extract_frames_with_unixtime(video_path, output_dir, fps=30):
+# ---- Convert UTC to UTC+7 ISO ----
+def to_utc7(dt: datetime) -> datetime:
+    return dt.astimezone(timezone(timedelta(hours=7)))
+
+def to_safe_filename(dt: datetime) -> str:
+    return dt.isoformat().replace(':', '-')
+
+def format_exif_datetime(dt: datetime) -> str:
+    return dt.strftime("%Y:%m:%d %H:%M:%S")
+
+# ---- Save image with EXIF ----
+def save_image_with_exif(img, filepath, dt: datetime):
+    exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+    exif_time_str = format_exif_datetime(dt)
+
+    # EXIF DateTimeOriginal
+    exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_time_str
+    exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = exif_time_str
+    exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_time_str
+
+    exif_bytes = piexif.dump(exif_dict)
+
+    # Save with OpenCV and then inject EXIF
+    temp_path = filepath + ".temp.jpg"
+    cv2.imwrite(temp_path, img)
+    piexif.insert(exif_bytes, temp_path, filepath)
+    os.remove(temp_path)
+
+# ---- Extract frames with ISO timestamps and EXIF ----
+def extract_frames_with_iso_exif(video_path, output_dir, fps=30):
     os.makedirs(output_dir, exist_ok=True)
     container = av.open(video_path)
     stream = container.streams.video[0]
 
     metadata = get_video_metadata(video_path)
-    base_unix = metadata.get("unix_timestamp") or int(time.time())
+    base_dt = metadata.get("datetime_utc") or datetime.now(timezone.utc)
 
     print(f"Extracting from: {os.path.basename(video_path)}")
-    print(f"Base Unix timestamp: {base_unix}")
-    print(f"Equivalent datetime: {datetime.fromtimestamp(base_unix).isoformat()}")
+    print(f"Base UTC time: {base_dt.isoformat()}")
+    print(f"Base UTC+7 time: {to_utc7(base_dt).isoformat()}")
 
     count = 0
     for frame in container.decode(video=0):
         if frame.pts is None:
             continue
 
-        # Calculate exact timestamp
         time_offset = float(frame.pts * stream.time_base)
-        exact_unix = base_unix + time_offset
-        unix_seconds = int(exact_unix)
-        milliseconds = int((exact_unix - unix_seconds) * 1000)
+        frame_dt = to_utc7(base_dt + timedelta(seconds=time_offset))
 
-        filename = f"{unix_seconds}_{milliseconds:03d}.jpg"
+        filename = f"{to_safe_filename(frame_dt)}.jpg"
         output_path = os.path.join(output_dir, filename)
-        
+
         img = frame.to_ndarray(format="bgr24")
-        cv2.imwrite(output_path, img)
+        save_image_with_exif(img, output_path, frame_dt)
+
         count += 1
 
-    print(f"Done: {count} frames extracted with Unix timestamps.")
+    print(f"Done: {count} frames extracted with ISO timestamps and EXIF.")
     container.close()
 
-# ---- Convert existing numbered frames to Unix timestamps ----
-def convert_numbered_to_unix(input_dir, output_dir, base_unix_time=None, fps=30):
-    """
-    Convert existing numbered frames (00000.jpg, 00001.jpg) to Unix timestamp format
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    base_time = base_unix_time or int(time.time())
-    print(f"Base Unix timestamp: {base_time}")
-    print(f"Equivalent datetime: {datetime.fromtimestamp(base_time).isoformat()}")
-
-    frame_files = sorted([f for f in os.listdir(input_dir) if f.endswith(('.jpg', '.png'))])
-    
-    for i, filename in enumerate(frame_files):
-        try:
-            frame_num = int(os.path.splitext(filename)[0])
-        except ValueError:
-            continue
-            
-        time_offset = frame_num / fps
-        exact_unix = base_time + time_offset
-        unix_seconds = int(exact_unix)
-        milliseconds = int((exact_unix - unix_seconds) * 1000)
-        
-        new_filename = f"{unix_seconds}_{milliseconds:03d}.jpg"
-        old_path = os.path.join(input_dir, filename)
-        new_path = os.path.join(output_dir, new_filename)
-        
-        # Copy file to preserve original
-        img = cv2.imread(old_path)
-        cv2.imwrite(new_path, img)
-        
-        print(f"Converted {filename} → {new_filename}")
-    
-    print(f"\nDone! Converted {len(frame_files)} frames to Unix timestamp format.")
-
 # ---- Process all videos ----
-def process_all_videos(input_dir, output_dir, mode="unixtime", fps=30):
+def process_all_videos(input_dir, output_dir, fps=30):
     os.makedirs(output_dir, exist_ok=True)
 
     for file in os.listdir(input_dir):
-        if file.lower().endswith((".mp4", ".mts", ".mov", ".avi", ".mpi")):
+        if file.lower().endswith((".mp4", ".mts", ".mov", ".avi", ".mkv")):
             video_path = os.path.join(input_dir, file)
             metadata = get_video_metadata(video_path)
 
             print(f"\n[Metadata] {file}:")
             print(f"  Duration: {float(metadata['duration']):.2f}s" if metadata['duration'] else "  Duration: N/A")
             print(f"  Bitrate: {metadata['bit_rate']} bps" if metadata['bit_rate'] else "  Bitrate: N/A")
-            print(f"  Creation time (Unix): {metadata['unix_timestamp']}" if metadata['unix_timestamp'] else "  Creation time: N/A")
+            print(f"  Creation time: {metadata['creation_time']}" if metadata['creation_time'] else "  Creation time: N/A")
 
+            creation_dt = metadata.get("datetime_utc")
             output_subdir = os.path.join(
-                output_dir, 
-                f"unix_{metadata['unix_timestamp'] or int(time.time())}_{os.path.splitext(file)[0]}"
+                output_dir,
+                f"ISO_{to_safe_filename(to_utc7(creation_dt))}__{os.path.splitext(file)[0]}"
             )
 
-            if mode == "unixtime":
-                extract_frames_with_unixtime(video_path, output_subdir, fps)
-            elif mode == "convert":
-                convert_numbered_to_unix(video_path, output_subdir, metadata.get("unix_timestamp"), fps)
-            else:
-                print(f"Unknown mode: {mode}")
+            extract_frames_with_iso_exif(video_path, output_subdir, fps)
 
-# ---- Entry point ----
+# ---- Entry Point ----
 if __name__ == "__main__":
     input_folder = r"C:\Users\moreno\programming\Scientific_Works\senyum\Not_experiment\OUTPUT_VID"
     output_folder = r"C:\Users\moreno\programming\Scientific_Works\senyum\Not_experiment\OUTPUT_VID\frames"
-    
-    # Choose mode:
-    # "unixtime" - extract frames directly with Unix timestamps
-    # "convert" - convert existing numbered frames to Unix timestamps
-    extract_mode = "convert"
-    frames_per_second = 30  # Adjust based on your video's FPS
-    
-    process_all_videos(input_folder, output_folder, mode=extract_mode, fps=frames_per_second)
+
+    frames_per_second = 30
+    process_all_videos(input_folder, output_folder, fps=frames_per_second)

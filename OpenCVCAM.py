@@ -5,11 +5,12 @@ import av
 import numpy as np
 import os
 import queue
-import datetime
+from datetime import datetime, timedelta, timezone
 from pygrabber.dshow_graph import FilterGraph
 import subprocess
 
-def add_start_time_metadata(mp4_path, start_time_str):
+# --- Add metadata to MP4 with proper UTC+7 timestamp and EXIF-style tag ---
+def add_start_time_metadata(mp4_path, timestamp_utc7):
     base, ext = os.path.splitext(mp4_path)
     output_path = base + "_withmeta" + ext
 
@@ -17,7 +18,9 @@ def add_start_time_metadata(mp4_path, start_time_str):
         'ffmpeg',
         '-y',
         '-i', mp4_path,
-        '-metadata', f'creation_time={start_time_str}',
+        '-map_metadata', '0',
+        '-metadata', f'creation_time={timestamp_utc7}',
+        '-metadata', f'com.apple.quicktime.creationdate={timestamp_utc7}',
         '-codec', 'copy',
         output_path
     ]
@@ -29,9 +32,11 @@ def add_start_time_metadata(mp4_path, start_time_str):
     except subprocess.CalledProcessError as e:
         print(f"[FFMPEG] Failed to add metadata: {e}")
 
+# --- Directory Setup ---
 OUTPUT_DIR = r"C:\Users\moreno\programming\Scientific_Works\senyum\Not_experiment\OUTPUT_VID"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# --- Camera Detection ---
 graph = FilterGraph()
 devices = graph.get_input_devices()
 max_cams_to_check = 10
@@ -47,13 +52,14 @@ for real_index in range(max_cams_to_check):
     except IndexError:
         name = "Unknown"
 
-    if name.startswith("GENERAL - UVC"):
+    if name.startswith("Integrated Camera"):
         cameras_identifier.append(real_index)
         print(f"Using camera index {real_index}: {name}")
     else:
         print(f"Skipping camera index {real_index}: {name}")
     cap.release()
 
+# --- Camera Thread Class ---
 class CameraWorker(threading.Thread):
     def __init__(self, cam_index):
         super().__init__()
@@ -64,9 +70,7 @@ class CameraWorker(threading.Thread):
 
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        if self.fps <= 0 or self.fps > 60:
-            self.fps = 30
+        self.fps = 30  # Force to 30 FPS
 
         self.frame = None
         self.running = True
@@ -96,7 +100,7 @@ class CameraWorker(threading.Thread):
         self.encoding_thread = threading.Thread(target=self.encoding_worker)
         self.encoding_thread.daemon = True
         self.encoding_thread.start()
-        print(f"[Camera {self.cam_index}] Recording started: {filename} at {self.fps} FPS")
+        print(f"[Camera {self.cam_index}] Recording started at {self.fps} FPS")
 
     def encoding_worker(self):
         while self.recording:
@@ -137,23 +141,25 @@ class CameraWorker(threading.Thread):
             except Exception as e:
                 print(f"Error closing output: {e}")
 
-            unix_start_time = int(self.start_time)
+            # --- Format timestamp in ISO 8601 with timezone +07:00 ---
+            tz_utc_plus_7 = timezone(timedelta(hours=7))
+            utc_plus_7 = datetime.fromtimestamp(self.start_time, tz=tz_utc_plus_7)
+            iso_time = utc_plus_7.isoformat()
+
             filename = os.path.join(OUTPUT_DIR, f'cam_{self.cam_index}.mp4')
-            add_start_time_metadata(filename, str(unix_start_time))
+            add_start_time_metadata(filename, iso_time)
 
     def run(self):
-        target_fps = self.fps
-        frame_interval = 1.0 / target_fps
+        frame_interval = 1.0 / self.fps
         last_capture_time = time.time()
         frame_count = 0
         display_interval = 2
+        tz_utc_plus_7 = timezone(timedelta(hours=7))
 
         while self.running:
             current_time = time.time()
-            time_since_last_capture = current_time - last_capture_time
-
-            if time_since_last_capture < frame_interval:
-                time.sleep(max(0.001, frame_interval - time_since_last_capture))
+            if current_time - last_capture_time < frame_interval:
+                time.sleep(max(0.001, frame_interval - (current_time - last_capture_time)))
                 continue
 
             ret, frame = self.cap.read()
@@ -161,21 +167,21 @@ class CameraWorker(threading.Thread):
                 time.sleep(0.01)
                 continue
 
-            last_capture_time = current_time
+            last_capture_time = time.time()
             frame_count += 1
             timestamp = time.time()
 
-            unix_time_text = f"{int(timestamp)}"
+            human_time = datetime.fromtimestamp(timestamp, tz=tz_utc_plus_7).strftime("%Y-%m-%d %H:%M:%S %z")
 
             if frame_count % display_interval == 0:
                 preview_frame = cv2.resize(frame, (0, 0), fx=self.preview_scale, fy=self.preview_scale)
-                cv2.putText(preview_frame, f'Cam {self.cam_index}: {unix_time_text}',
+                cv2.putText(preview_frame, f'Cam {self.cam_index}: {human_time}',
                             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 with self.lock:
                     self.frame = preview_frame
 
             if self.recording and not self.frame_queue.full():
-                cv2.putText(frame, f'Cam {self.cam_index}: {unix_time_text}',
+                cv2.putText(frame, f'Cam {self.cam_index}: {human_time}',
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 try:
                     self.frame_queue.put((frame.copy(), timestamp), block=False)
@@ -185,6 +191,7 @@ class CameraWorker(threading.Thread):
         self.stop_recording()
         self.cap.release()
 
+# --- Smart Display Combiner ---
 class SmartCombiner:
     def __init__(self, max_width=1920, max_height=1080):
         self.max_width = max_width
@@ -223,14 +230,13 @@ class SmartCombiner:
         grid_h, grid_w = grid.shape[:2]
         if grid_w > self.max_width or grid_h > self.max_height:
             scale = min(self.max_width / grid_w, self.max_height / grid_h)
-            new_w = int(grid_w * scale)
-            new_h = int(grid_h * scale)
-            grid = cv2.resize(grid, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            grid = cv2.resize(grid, (int(grid_w * scale), int(grid_h * scale)), interpolation=cv2.INTER_AREA)
 
         self.last_grid = grid
         self.last_update = current_time
         return grid
 
+# --- Main Function ---
 def main():
     cameras = []
     for i in cameras_identifier:
@@ -248,7 +254,7 @@ def main():
         cam.start()
 
     recording = False
-    print("Press 'r' to start/stop recording, 'q' to quit.")
+    print("Press 'r' to start/stop recording, 'Spacebar' to quit.")
     window_name = 'MULTICAM'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     combiner = SmartCombiner()
@@ -261,17 +267,14 @@ def main():
 
             if current_time - last_ui_update < ui_refresh_rate:
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
+                if key == 32:  # spacebar
                     break
                 elif key == ord('r'):
                     recording = not recording
-                    if recording:
-                        print("Starting recording all cameras...")
-                        for cam in cameras:
+                    for cam in cameras:
+                        if recording:
                             cam.start_recording()
-                    else:
-                        print("Stopping recording all cameras...")
-                        for cam in cameras:
+                        else:
                             cam.stop_recording()
                 time.sleep(0.001)
                 continue
@@ -292,17 +295,14 @@ def main():
                 last_ui_update = current_time
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            if key == 32:  # spacebar
                 break
             elif key == ord('r'):
                 recording = not recording
-                if recording:
-                    print("Starting recording all cameras...")
-                    for cam in cameras:
+                for cam in cameras:
+                    if recording:
                         cam.start_recording()
-                else:
-                    print("Stopping recording all cameras...")
-                    for cam in cameras:
+                    else:
                         cam.stop_recording()
 
     except KeyboardInterrupt:
@@ -314,5 +314,6 @@ def main():
         cv2.destroyAllWindows()
         print("Program exited cleanly.")
 
+# --- Run Main ---
 if __name__ == "__main__":
     main()
