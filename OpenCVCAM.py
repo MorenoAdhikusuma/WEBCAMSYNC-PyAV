@@ -8,6 +8,7 @@ import queue
 from datetime import datetime, timedelta, timezone
 from pygrabber.dshow_graph import FilterGraph
 import subprocess
+from fractions import Fraction   
 
 # --- Add metadata to MP4 with proper UTC+7 timestamp and EXIF-style tag ---
 def add_start_time_metadata(mp4_path, timestamp_utc7):
@@ -33,7 +34,7 @@ def add_start_time_metadata(mp4_path, timestamp_utc7):
         print(f"[FFMPEG] Failed to add metadata: {e}")
 
 # --- Directory Setup ---
-OUTPUT_DIR = r"C:\Users\moreno\programming\Scientific_Works\senyum\Not_experiment\OUTPUT_VID"
+OUTPUT_DIR = r"D:\Machine learning code\riset\OUTPUT"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # --- Camera Detection ---
@@ -52,7 +53,7 @@ for real_index in range(max_cams_to_check):
     except IndexError:
         name = "Unknown"
 
-    if name.startswith("Integrated Camera"):
+    if name.startswith("GENERAL - UVC "):
         cameras_identifier.append(real_index)
         print(f"Using camera index {real_index}: {name}")
     else:
@@ -70,7 +71,7 @@ class CameraWorker(threading.Thread):
 
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.fps = 30  # Force to 30 FPS
+        self.fps = 20  # Force to 20 FPS
 
         self.frame = None
         self.running = True
@@ -110,10 +111,14 @@ class CameraWorker(threading.Thread):
                     break
                 frame, timestamp = frame_data
                 video_frame = av.VideoFrame.from_ndarray(frame, format='bgr24')
-                pts = int((timestamp - self.start_time) * self.fps)
-                video_frame.pts = pts
+
+                # ✅ Force exact 20 fps with frame counter
+                video_frame.pts = self.frame_count
+                video_frame.time_base = Fraction(1, self.fps)
+
                 for packet in self.stream.encode(video_frame):
                     self.output.mux(packet)
+
                 self.frame_count += 1
                 self.frame_queue.task_done()
             except queue.Empty:
@@ -121,6 +126,7 @@ class CameraWorker(threading.Thread):
             except Exception as e:
                 print(f"Error in encoding thread: {e}")
 
+        # flush encoder saat stop
         try:
             for packet in self.stream.encode(None):
                 self.output.mux(packet)
@@ -171,7 +177,7 @@ class CameraWorker(threading.Thread):
             frame_count += 1
             timestamp = time.time()
 
-            human_time = datetime.fromtimestamp(timestamp, tz=tz_utc_plus_7).strftime("%Y-%m-%d %H:%M:%S %z")
+            human_time = datetime.fromtimestamp(timestamp, tz=tz_utc_plus_7).strftime("%Y-%m-%d %H:%M:%S")
 
             if frame_count % display_interval == 0:
                 preview_frame = cv2.resize(frame, (0, 0), fx=self.preview_scale, fy=self.preview_scale)
