@@ -1,0 +1,4 @@
+sessions/**
+*.mp4
+frames/
+*.csv
