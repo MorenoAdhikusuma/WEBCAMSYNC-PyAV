@@ -2,3 +2,5 @@ sessions/**
 *.mp4
 frames/
 *.csv
+.venv/
+venv/
