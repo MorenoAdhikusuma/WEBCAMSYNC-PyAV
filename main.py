@@ -1,4 +1,4 @@
-import sys, os, time, csv, subprocess
+import sys, os, time, csv, subprocess, json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from functools import partial
@@ -24,7 +24,31 @@ import pythoncom
 import av
 import piexif
 
-# ============================ Time Helpers (UTC+7) ============================
+# ============================ Configuration ============================
+def load_config(config_path: str = "./config.json") -> dict:
+    """Load config with ESP IP. Returns default if not found."""
+    default_config = {"esp_ip": "192.168.4.1"}
+    try:
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                return {**default_config, **loaded}
+    except Exception as e:
+        print(f"[CONFIG] Error loading config: {e}")
+    return default_config
+
+def save_config(config: dict, config_path: str = "./config.json"):
+    """Save config to file."""
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        print(f"[CONFIG] Error saving config: {e}")
+
+# Load global config
+_GLOBAL_CONFIG = load_config()
+
+# ============================ Time Helpers (UTC+7) =============================
 TZ_UTC7 = timezone(timedelta(hours=7))
 
 def now_epoch_ms() -> int:
@@ -85,9 +109,39 @@ def esp_request(base: str, endpoint: str, label: str, log_cb):
     except Exception as e:
         log_cb(f"{label} error: {e}")
 
-def parse_esp_csv(line: str):
-    # timestamp,tick_ms,seq,ax,ay,az,gx,gy,gz,temp
-    parts = line.strip().split(",", 10)
+def parse_imu_data(line: str):
+    """
+    Parse IMU data - handles both JSON (ESP-NOW) and CSV (Serial) formats.
+    JSON format: {"timestamp":"...","tick_ms":...,"seq":...,"accel":{"x":...,"y":...,"z":...},"gyro":{"x":...,"y":...,"z":...},"temp":...}
+    CSV format: timestamp,tick_ms,seq,ax,ay,az,gx,gy,gz,temp
+    """
+    line = line.strip()
+    if not line:
+        return None
+    
+    # Try JSON format first (ESP-NOW via HTTP)
+    if line.startswith("{") and line.endswith("}"):
+        try:
+            data = json.loads(line)
+            accel = data.get("accel", {})
+            gyro = data.get("gyro", {})
+            return {
+                "timestamp": data.get("timestamp", ""),
+                "tick_ms": int(data.get("tick_ms", 0)),
+                "seq": int(data.get("seq", 0)),
+                "ax": float(accel.get("x", 0)),
+                "ay": float(accel.get("y", 0)),
+                "az": float(accel.get("z", 0)),
+                "gx": float(gyro.get("x", 0)),
+                "gy": float(gyro.get("y", 0)),
+                "gz": float(gyro.get("z", 0)),
+                "temp": float(data.get("temp", 0))
+            }
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            pass
+    
+    # Fallback to CSV format (Serial)
+    parts = line.split(",", 10)
     if len(parts) < 10:
         return None
     try:
@@ -100,7 +154,7 @@ def parse_esp_csv(line: str):
             "gx": float(gx), "gy": float(gy), "gz": float(gz),
             "temp": float(temp)
         }
-    except Exception:
+    except (ValueError, IndexError):
         return None
 
 # ============================ Host↔IMU Clock Sync (NO firmware changes) ============================
@@ -280,7 +334,7 @@ class SerialIMULogger(QThread):
                             if empty == 50:
                                 self.log.emit("⚠️ No IMU data yet...")
                             continue
-                        parsed = parse_esp_csv(line)
+                        parsed = parse_imu_data(line)
                         if not parsed:
                             continue
                         empty = 0
@@ -771,7 +825,9 @@ class MainWindow(QMainWindow):
 
         esp_row = QHBoxLayout()
         esp_row.addWidget(QLabel("ESP32 IP:"))
-        self.esp_ip_edit = QLineEdit("http://192.168.4.1"); esp_row.addWidget(self.esp_ip_edit)
+        esp_ip_value = f"http://{_GLOBAL_CONFIG.get('esp_ip', '192.168.4.1')}"
+        self.esp_ip_edit = QLineEdit(esp_ip_value); esp_row.addWidget(self.esp_ip_edit)
+        self.esp_ip_edit.editingFinished.connect(self.on_esp_ip_changed)
         self.btn_esp_start = QPushButton("Start Stream"); self.btn_esp_stop = QPushButton("Stop Stream")
         self.btn_esp_recal = QPushButton("Recalibrate")
         self.esp_delay_edit = QLineEdit("20"); self.esp_delay_edit.setMaximumWidth(60)
@@ -782,12 +838,25 @@ class MainWindow(QMainWindow):
 
         # --- IMU realtime numeric panel
         grid = QGridLayout(); self.imu_labels={}
-        fields = ["seq","tick_ms","ax","ay","az","gx","gy","gz","temp"]
+        fields = ["seq","tick_ms","ax","ay","az","gx","gy","gz","temp","rate"]
         grid.addWidget(QLabel("IMU (Realtime):"),0,0,1,2)
         for r,k in enumerate(fields, start=1):
             kL=QLabel(k+":"); vL=QLabel("--"); self.imu_labels[k]=vL
             grid.addWidget(kL,r,0); grid.addWidget(vL,r,1)
         root.addLayout(grid)
+        
+        # --- ESP Status row
+        esp_status_row = QHBoxLayout()
+        self.esp_status_label = QLabel("ESP: Disconnected")
+        self.esp_status_label.setStyleSheet("color:#888;font-weight:bold;")
+        self.esp_rate_label = QLabel("Rate: -- pkt/s")
+        self.esp_rate_label.setStyleSheet("color:#888;")
+        self.btn_esp_status = QPushButton("Check Status")
+        esp_status_row.addWidget(self.esp_status_label)
+        esp_status_row.addWidget(self.esp_rate_label)
+        esp_status_row.addWidget(self.btn_esp_status)
+        esp_status_row.addStretch()
+        root.addLayout(esp_status_row)
 
         # --- Session name
         frow = QHBoxLayout()
@@ -822,6 +891,8 @@ class MainWindow(QMainWindow):
         self.is_previewing=False; self.is_recording=False; self.extract_thread=None
         self.latest_imu_packet=None; self.imu_update_timer=None
         self._cached_device_list=None; self._device_cache_time=0
+        self._imu_packet_count=0; self._imu_rate_timer=None; self._imu_last_count=0
+        self._esp_connected=False
 
         # --- Wire
         self.refresh_btn.clicked.connect(self.refresh_cameras)
@@ -834,6 +905,7 @@ class MainWindow(QMainWindow):
         self.btn_esp_stop.clicked.connect(lambda: esp_request(self.esp_base(), "/stream/stop", "ESP stop", self.log_msg))
         self.btn_esp_recal.clicked.connect(lambda: esp_request(self.esp_base(), "/imu/recalibrate", "ESP recal", self.log_msg))
         self.btn_esp_delay.clicked.connect(self.esp_set_delay)
+        self.btn_esp_status.clicked.connect(self.check_esp_status)
         self.btn_imu_only_start.clicked.connect(self.start_imu_only)
         self.btn_imu_only_stop.clicked.connect(self.stop_imu_only)
         self.extract_btn.clicked.connect(self.extract_frames)
@@ -851,12 +923,44 @@ class MainWindow(QMainWindow):
     def esp_base(self) -> str:
         return self.esp_ip_edit.text().strip().rstrip("/")
 
+    def on_esp_ip_changed(self):
+        """Save IP to config when edited."""
+        full_url = self.esp_base()
+        # Extract IP from URL (remove http:// prefix if present)
+        ip_only = full_url.replace("http://", "").replace("https://", "").strip()
+        _GLOBAL_CONFIG["esp_ip"] = ip_only
+        save_config(_GLOBAL_CONFIG)
+        self.log_msg(f"✓ ESP IP saved: {ip_only}")
+
     def esp_set_delay(self):
         try:
             val=int(self.esp_delay_edit.text())
         except ValueError:
             self.log_msg("ESP delay invalid"); return
-        esp_request(self.esp_base(), f"/imu/delay?value={val}", "ESP set delay", self.log_msg)
+        esp_request(self.esp_base(), f"/imu/delay?ms={val}", "ESP set delay", self.log_msg)
+
+    def check_esp_status(self):
+        """Check ESP status via API and update UI."""
+        base = self.esp_base()
+        try:
+            r = requests.get(f"{base}/status", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                self._esp_connected = True
+                stream_state = data.get("stream", "off")
+                self.esp_status_label.setText(f"ESP: Connected (Stream: {stream_state})")
+                self.esp_status_label.setStyleSheet("color:#00ff00;font-weight:bold;")
+                self.log_msg(f"ESP Status: stream={stream_state}, imu_delay={data.get('imu_delay_ms')}ms, "
+                             f"send_ok={data.get('send_ok')}, sd={data.get('sd_available')}")
+            else:
+                self._esp_connected = False
+                self.esp_status_label.setText(f"ESP: Error {r.status_code}")
+                self.esp_status_label.setStyleSheet("color:#ff8800;font-weight:bold;")
+        except Exception as e:
+            self._esp_connected = False
+            self.esp_status_label.setText(f"ESP: Disconnected")
+            self.esp_status_label.setStyleSheet("color:#888;font-weight:bold;")
+            self.log_msg(f"ESP status check failed: {e}")
 
     # ---------- AI toggle ----------
     def on_toggle_anonymization(self, state: int):
@@ -980,6 +1084,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot(dict)
     def update_imu_preview(self, parsed: dict):
         self.latest_imu_packet = parsed
+        self._imu_packet_count += 1
         if self.imu_update_timer is None:
             self.imu_update_timer = QTimer()
             self.imu_update_timer.timeout.connect(self._update_imu_ui)
@@ -997,6 +1102,27 @@ class MainWindow(QMainWindow):
             else:
                 try: lab.setText(f"{float(v):.3f}")
                 except: lab.setText("--")
+        rate_lab = self.imu_labels.get("rate")
+        if rate_lab:
+            rate_lab.setText(f"{self._imu_packet_count} pkts")
+            if self._imu_rate_timer and self._imu_rate_timer.isActive():
+                pass
+            else:
+                self._start_rate_calc()
+    
+    def _start_rate_calc(self):
+        if self._imu_rate_timer is None:
+            self._imu_rate_timer = QTimer()
+            self._imu_rate_timer.timeout.connect(self._calc_imu_rate)
+            self._imu_rate_timer.start(1000)
+        self._imu_last_count = self._imu_packet_count
+    
+    def _calc_imu_rate(self):
+        rate = self._imu_packet_count - self._imu_last_count
+        self._imu_last_count = self._imu_packet_count
+        rate_lab = self.imu_labels.get("rate")
+        if rate_lab:
+            rate_lab.setText(f"{rate} pkt/s")
 
     # ---------- IMU-only ----------
     def start_imu_only(self):
@@ -1028,6 +1154,9 @@ class MainWindow(QMainWindow):
         self.log_msg("Stopping IMU Monitor...")
         self.imu_thread.stop(); self.imu_thread.wait(2000); self.imu_thread=None
         self.btn_imu_only_start.setEnabled(True); self.btn_imu_only_stop.setEnabled(False)
+        self._imu_packet_count = 0
+        if self._imu_rate_timer:
+            self._imu_rate_timer.stop()
         self.log_msg("IMU Monitor stopped")
 
     # ---------- Recording ----------
@@ -1088,7 +1217,7 @@ class MainWindow(QMainWindow):
             t.log.connect(self.log_msg)
             t.frame_ready.connect(partial(self.update_preview, i))
             t.start(); self.cam_threads.append(t)
-
+    
         self.is_recording=True
         self.preview_status_label.setText("Status: RECORDING")
         self.preview_status_label.setStyleSheet("color:#ff0000;font-weight:bold;")
@@ -1112,6 +1241,10 @@ class MainWindow(QMainWindow):
 
         if self.imu_thread:
             self.imu_thread.stop(); self.imu_thread.wait(2000); self.imu_thread=None
+
+        self._imu_packet_count = 0
+        if self._imu_rate_timer:
+            self._imu_rate_timer.stop()
 
         self.is_recording=False
         self.start_btn.setEnabled(True); self.stop_btn.setEnabled(False)

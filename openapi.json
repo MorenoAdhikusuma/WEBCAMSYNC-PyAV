@@ -1,0 +1,773 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "IMU-FD-NOW ESP32 Control API",
+    "description": "REST API for controlling the ESP32 IMU data logger with ESP-NOW streaming. Supports configuring IMU sampling rate, managing SD card logging, ESP-NOW peer configuration, and real-time status monitoring.",
+    "version": "1.0.0",
+    "contact": {
+      "name": "Device Support"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://{ip}",
+      "description": "ESP32 Device",
+      "variables": {
+        "ip": {
+          "default": "192.168.1.100",
+          "description": "Device IP address"
+        }
+      }
+    }
+  ],
+  "tags": [
+    {
+      "name": "Stream",
+      "description": "Data streaming control"
+    },
+    {
+      "name": "IMU",
+      "description": "IMU configuration"
+    },
+    {
+      "name": "SD Card",
+      "description": "SD card logging operations"
+    },
+    {
+      "name": "Peer",
+      "description": "ESP-NOW peer management"
+    },
+    {
+      "name": "Display",
+      "description": "OLED display control"
+    },
+    {
+      "name": "Status",
+      "description": "Device status and diagnostics"
+    }
+  ],
+  "paths": {
+    "/stream/start": {
+      "post": {
+        "operationId": "startStream",
+        "summary": "Start streaming and SD logging",
+        "description": "Enables ESP-NOW data streaming and starts SD card logging if available.",
+        "tags": ["Stream"],
+        "responses": {
+          "200": {
+            "description": "Streaming started successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamResponse"
+                },
+                "example": {
+                  "stream": "on"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/stream/stop": {
+      "post": {
+        "operationId": "stopStream",
+        "summary": "Stop streaming and SD logging",
+        "description": "Disables ESP-NOW data streaming and stops SD card logging.",
+        "tags": ["Stream"],
+        "responses": {
+          "200": {
+            "description": "Streaming stopped successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamResponse"
+                },
+                "example": {
+                  "stream": "off"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/stream/toggle": {
+      "post": {
+        "operationId": "toggleStream",
+        "summary": "Toggle streaming state",
+        "description": "Toggles between start and stop streaming states.",
+        "tags": ["Stream"],
+        "responses": {
+          "200": {
+            "description": "Current streaming state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/imu/delay": {
+      "get": {
+        "operationId": "getDelay",
+        "summary": "Get current IMU delay",
+        "description": "Returns the current IMU sampling delay in milliseconds.",
+        "tags": ["IMU"],
+        "responses": {
+          "200": {
+            "description": "Current IMU delay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DelayResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "setDelay",
+        "summary": "Set IMU sampling delay",
+        "description": "Configures the IMU sampling interval. Use either `ms` or `hz` parameter. The device will restart sampling with the new delay on the next cycle.",
+        "tags": ["IMU"],
+        "parameters": [
+          {
+            "name": "ms",
+            "in": "query",
+            "description": "Delay in milliseconds (5-1000ms)",
+            "schema": {
+              "type": "integer",
+              "minimum": 5,
+              "maximum": 1000,
+              "example": 20
+            }
+          },
+          {
+            "name": "hz",
+            "in": "query",
+            "description": "Sampling frequency in Hz (1-200Hz). 20ms interval = 50Hz",
+            "schema": {
+              "type": "number",
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Delay updated successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DelayResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "hz must be > 0"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/imu/recalibrate": {
+      "post": {
+        "operationId": "recalibrateIMU",
+        "summary": "Start ellipsoidal calibration",
+        "description": "Triggers 6-position ellipsoidal calibration. The device will collect 768 samples (128 per position) and fit an ellipsoid to compute offset and 3x3 correction matrix. Calibration runs automatically with OLED instructions showing each position. Parameters are saved to EEPROM.",
+        "tags": ["IMU"],
+        "responses": {
+          "200": {
+            "description": "Calibration started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrationStartResponse"
+                },
+                "example": {
+                  "calibration": "started",
+                  "state": "collecting"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/imu/calib/status": {
+      "get": {
+        "operationId": "getCalibStatus",
+        "summary": "Get calibration status",
+        "description": "Returns the current calibration state, position (0-5), sample index (0-127), and whether stored calibration is valid.",
+        "tags": ["IMU"],
+        "responses": {
+          "200": {
+            "description": "Calibration status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibStatusResponse"
+                },
+                "example": {
+                  "state": "collecting",
+                  "position": 2,
+                  "sample_idx": 45,
+                  "valid": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sd/start": {
+      "post": {
+        "operationId": "startSDLogging",
+        "summary": "Start SD card logging",
+        "description": "Begins logging IMU data to SD card. Creates a new timestamped CSV file.",
+        "tags": ["SD Card"],
+        "responses": {
+          "200": {
+            "description": "Logging started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SDStartResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "SD card not available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "example": {
+                  "error": "SD not available"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sd/stop": {
+      "post": {
+        "operationId": "stopSDLogging",
+        "summary": "Stop SD card logging",
+        "description": "Stops SD card logging and flushes any pending data to disk.",
+        "tags": ["SD Card"],
+        "responses": {
+          "200": {
+            "description": "Logging stopped",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SDStopResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sd/status": {
+      "get": {
+        "operationId": "getSDStatus",
+        "summary": "Get SD card status",
+        "description": "Returns current SD card availability and logging state.",
+        "tags": ["SD Card"],
+        "responses": {
+          "200": {
+            "description": "SD card status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SDStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/peer/get": {
+      "get": {
+        "operationId": "getPeer",
+        "summary": "Get ESP-NOW peer",
+        "description": "Returns the configured ESP-NOW peer MAC address and channel.",
+        "tags": ["Peer"],
+        "responses": {
+          "200": {
+            "description": "Peer configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PeerResponse"
+                },
+                "example": {
+                  "peer_mac": "AA:BB:CC:DD:EE:FF",
+                  "peer_channel": 6
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/peer/set": {
+      "post": {
+        "operationId": "setPeer",
+        "summary": "Set ESP-NOW peer",
+        "description": "Configures the ESP-NOW peer for data transmission. MAC address is required, channel is optional (defaults to current WiFi channel).",
+        "tags": ["Peer"],
+        "parameters": [
+          {
+            "name": "mac",
+            "in": "query",
+            "required": true,
+            "description": "Peer MAC address (AA:BB:CC:DD:EE:FF format)",
+            "schema": {
+              "type": "string",
+              "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$",
+              "example": "AA:BB:CC:DD:EE:FF"
+            }
+          },
+          {
+            "name": "ch",
+            "in": "query",
+            "description": "ESP-NOW channel (0-14, 0 = auto)",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 14,
+              "example": 6
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Peer configured successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PeerSetResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid parameters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/peer/reset": {
+      "post": {
+        "operationId": "resetPeer",
+        "summary": "Reset ESP-NOW peer",
+        "description": "Clears the configured ESP-NOW peer and reinitializes ESP-NOW.",
+        "tags": ["Peer"],
+        "responses": {
+          "200": {
+            "description": "Peer reset successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PeerResetResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/display/toggle": {
+      "post": {
+        "operationId": "toggleDisplay",
+        "summary": "Toggle OLED display",
+        "description": "Toggles the OLED display on/off to conserve power.",
+        "tags": ["Display"],
+        "responses": {
+          "200": {
+            "description": "Display state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DisplayResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/status": {
+      "get": {
+        "operationId": "getStatus",
+        "summary": "Get device status",
+        "description": "Returns comprehensive device status including streaming state, IMU delay, network statistics, and SD card logging info.",
+        "tags": ["Status"],
+        "responses": {
+          "200": {
+            "description": "Device status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                },
+                "example": {
+                  "ip": "192.168.1.100",
+                  "stream": "on",
+                  "ntp_synced": true,
+                  "imu_delay_ms": 20,
+                  "transport": "espnow",
+                  "peer_mac": "AA:BB:CC:DD:EE:FF",
+                  "peer_channel": 6,
+                  "send_ok": 15234,
+                  "send_fail": 2,
+                  "last_send_status": 0,
+                  "calibrating": false,
+                  "latency_ms": 12,
+                  "loop_dt_avg_ms": 20,
+                  "jitter_avg_ms": 1,
+                  "sd_available": true,
+                  "logging_enabled": true,
+                  "log_records": 15234,
+                  "log_errors": 0,
+                  "log_file": "/IMU_DATA/IMU_20251022_143022.csv"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/net/tune": {
+      "post": {
+        "operationId": "tuneNetwork",
+        "summary": "Optimize network performance",
+        "description": "Applies WiFi power and sleep settings to maximize ESP-NOW performance: disables power save, disables WiFi sleep, sets max TX power (19.5dBm).",
+        "tags": ["Status"],
+        "responses": {
+          "200": {
+            "description": "Network tuned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NetTuneResponse"
+                },
+                "example": {
+                  "wifi": "tuned"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "StreamResponse": {
+        "type": "object",
+        "properties": {
+          "stream": {
+            "type": "string",
+            "enum": ["on", "off"]
+          }
+        }
+      },
+      "DelayResponse": {
+        "type": "object",
+        "properties": {
+          "imu_delay_ms": {
+            "type": "integer",
+            "description": "Current IMU sampling delay in milliseconds",
+            "example": 20,
+            "minimum": 5,
+            "maximum": 1000
+          }
+        }
+      },
+      "CalibrationStartResponse": {
+        "type": "object",
+        "properties": {
+          "calibration": {
+            "type": "string",
+            "enum": ["started"],
+            "description": "Confirmation that calibration was initiated"
+          },
+          "state": {
+            "type": "string",
+            "enum": ["collecting", "idle"],
+            "description": "Current calibration state"
+          }
+        }
+      },
+      "CalibStatusResponse": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": ["idle", "collecting", "fitting", "success", "failed"],
+            "description": "Current calibration state"
+          },
+          "position": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6,
+            "description": "Current position (0-5), 6 means collection complete"
+          },
+          "sample_idx": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 128,
+            "description": "Current sample index within position (0-127)"
+          },
+          "valid": {
+            "type": "boolean",
+            "description": "Whether stored calibration parameters are valid"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error message describing what went wrong"
+          }
+        }
+      },
+      "SDStartResponse": {
+        "type": "object",
+        "properties": {
+          "logging_started": {
+            "type": "boolean"
+          },
+          "file": {
+            "type": "string",
+            "description": "Path to the current log file",
+            "example": "/IMU_DATA/IMU_20251022_143022.csv"
+          }
+        }
+      },
+      "SDStopResponse": {
+        "type": "object",
+        "properties": {
+          "logging_stopped": {
+            "type": "boolean"
+          },
+          "final_records": {
+            "type": "integer",
+            "description": "Total records written to the log file"
+          },
+          "write_errors": {
+            "type": "integer",
+            "description": "Number of write errors encountered"
+          }
+        }
+      },
+      "SDStatusResponse": {
+        "type": "object",
+        "properties": {
+          "sd_available": {
+            "type": "boolean",
+            "description": "Whether SD card is present and initialized"
+          },
+          "logging_enabled": {
+            "type": "boolean",
+            "description": "Whether SD logging is currently active"
+          },
+          "current_file": {
+            "type": "string",
+            "description": "Path to the current log file (empty if not logging)"
+          },
+          "records_written": {
+            "type": "integer",
+            "description": "Number of records written to current file"
+          },
+          "write_errors": {
+            "type": "integer",
+            "description": "Number of write errors for current file"
+          }
+        }
+      },
+      "PeerResponse": {
+        "type": "object",
+        "properties": {
+          "peer_mac": {
+            "type": "string",
+            "description": "ESP-NOW peer MAC address",
+            "example": "AA:BB:CC:DD:EE:FF"
+          },
+          "peer_channel": {
+            "type": "integer",
+            "description": "ESP-NOW channel (0 = auto/current WiFi channel)"
+          }
+        }
+      },
+      "PeerSetResponse": {
+        "type": "object",
+        "properties": {
+          "peer_added": {
+            "type": "boolean",
+            "description": "Whether peer was added to ESP-NOW"
+          },
+          "saved": {
+            "type": "boolean",
+            "description": "Whether peer config was saved to EEPROM"
+          },
+          "peer_mac": {
+            "type": "string",
+            "description": "Configured peer MAC address"
+          },
+          "peer_channel": {
+            "type": "integer",
+            "description": "Configured ESP-NOW channel"
+          }
+        }
+      },
+      "PeerResetResponse": {
+        "type": "object",
+        "properties": {
+          "peer_reset": {
+            "type": "boolean"
+          },
+          "saved": {
+            "type": "boolean",
+            "description": "Whether empty peer config was saved to EEPROM"
+          }
+        }
+      },
+      "DisplayResponse": {
+        "type": "object",
+        "properties": {
+          "display_enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "NetTuneResponse": {
+        "type": "object",
+        "properties": {
+          "wifi": {
+            "type": "string",
+            "enum": ["tuned"]
+          }
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "properties": {
+          "ip": {
+            "type": "string",
+            "description": "Device IP address"
+          },
+          "stream": {
+            "type": "string",
+            "enum": ["on", "off"],
+            "description": "Streaming state"
+          },
+          "ntp_synced": {
+            "type": "boolean",
+            "description": "Whether NTP time sync is active"
+          },
+          "imu_delay_ms": {
+            "type": "integer",
+            "description": "Current IMU sampling delay"
+          },
+          "transport": {
+            "type": "string",
+            "enum": ["espnow"],
+            "description": "Data transport protocol"
+          },
+          "peer_mac": {
+            "type": "string",
+            "description": "ESP-NOW peer MAC address"
+          },
+          "peer_channel": {
+            "type": "integer",
+            "description": "ESP-NOW channel"
+          },
+          "send_ok": {
+            "type": "integer",
+            "description": "Successful ESP-NOW transmissions"
+          },
+          "send_fail": {
+            "type": "integer",
+            "description": "Failed ESP-NOW transmissions"
+          },
+          "last_send_status": {
+            "type": "integer",
+            "description": "Last send status (0 = success)"
+          },
+          "calibrating": {
+            "type": "boolean",
+            "description": "Whether IMU is currently calibrating"
+          },
+          "latency_ms": {
+            "type": "integer",
+            "description": "Estimated NTP latency in milliseconds"
+          },
+          "loop_dt_avg_ms": {
+            "type": "integer",
+            "description": "Average loop interval (should match imu_delay_ms)"
+          },
+          "jitter_avg_ms": {
+            "type": "integer",
+            "description": "Average timing jitter in milliseconds"
+          },
+          "sd_available": {
+            "type": "boolean",
+            "description": "SD card availability"
+          },
+          "logging_enabled": {
+            "type": "boolean",
+            "description": "SD logging state"
+          },
+          "log_records": {
+            "type": "integer",
+            "description": "Total records written to current log file"
+          },
+          "log_errors": {
+            "type": "integer",
+            "description": "Write errors for current log file"
+          },
+          "log_file": {
+            "type": "string",
+            "description": "Current log file path"
+          }
+        }
+      }
+    }
+  }
+}
